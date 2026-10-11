@@ -23,13 +23,15 @@ public interface FileRepository extends JpaRepository<Files, UUID> {
           UPDATE files SET status='RECONCILING', updated_at = now()
           WHERE id IN (
           SELECT id FROM files
-          WHERE status in ('UPLOADING','INITIATED')
-          AND created_at < :cutoff 
+          WHERE (status in ('UPLOADING','INITIATED')
+          AND created_at < :cutoff) OR (status = 'RECONCILING' AND updated_at < :reclaimCutoff) 
           LIMIT :batchSize
           FOR UPDATE SKIP LOCKED
           )
           RETURNING id
           """,nativeQuery = true)
-    List<UUID> claimStaleUploads(@Param("cutoff") OffsetDateTime cutoff, @Param("batchSize") int batchSize);
+    List<UUID> claimStaleUploads(@Param("cutoff") OffsetDateTime cutoff,
+                                 @Param("reclaimCutoff") OffsetDateTime reclaimCutoff,
+                                 @Param("batchSize") int batchSize);
 }
 

@@ -1,6 +1,7 @@
 package org.application.s3service;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import org.application.exception.BadRequestException;
 import org.application.dto.*;
 import org.application.entity.FileChunk;
 import org.application.entity.Files;
@@ -9,6 +10,9 @@ import org.application.exception.FileNotFoundException;
 import org.application.exception.InvalidUploadStateException;
 import org.application.repository.FileChunkRepository;
 import org.application.repository.FileRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -31,6 +35,7 @@ public class FileService {
     private final Counter uploadsCompletedCounter;
     private final Counter uploadsFailedCounter;
     private final Timer uploadCompletionTimer;
+    private static final Logger log = LoggerFactory.getLogger(FileService.class);
 
     public FileService(FileRepository fileRepository, FileChunkRepository fileChunkRepository,
                        S3StorageService s3StorageService, MeterRegistry meterRegistry){
@@ -57,7 +62,15 @@ public class FileService {
         file.setTotalSizeBytes(request.totalSizeBytes());
         file.setStatus(UploadStatus.INITIATED);
         file.setIdempotencyKey(idempotencyKey);
-        file = fileRepository.save(file);
+        //file = fileRepository.save(file);
+
+        try{
+            file = fileRepository.saveAndFlush(file);
+        }catch(DataIntegrityViolationException e){
+            if(idempotencyKey==null || idempotencyKey.isBlank()) throw e;
+            return fileRepository.findByUserIdAndIdempotencyKey(userId,idempotencyKey)
+                    .map(this::toResponse).orElseThrow(() -> e);
+        }
 
         String key = R2KeyGenerator.generatedKey(userId,file.getId(),request.fileName());
         String uploadId = s3StorageService.startMultipartUpload(key);
@@ -72,7 +85,13 @@ public class FileService {
     }
 
     public PreSignedUrlResponse presignPart(String userId, UUID fileId, int partNumber){
+        if(partNumber < 1 || partNumber > 10_000){
+            throw new BadRequestException("partNumber must be between 1 and 10000");
+        }
         Files file = getOwnedFileOrThrow(userId,fileId);
+        if(file.getStatus() != UploadStatus.UPLOADING){
+            throw new InvalidUploadStateException("File is not uploading : " + file.getStatus());
+        }
         String url = s3StorageService.generatePreSignedUrlForPart
                 (file.getS3Key(),file.getS3MultipartUploadId(),partNumber);
         return new PreSignedUrlResponse(url);
@@ -125,7 +144,11 @@ public class FileService {
     }
 
     public PreSignedUrlResponse preSignDownload(String userId,UUID fileId){
+
         Files file = getOwnedFileOrThrow(userId,fileId);
+        if(file.getStatus() != UploadStatus.COMPLETED){
+            throw new InvalidUploadStateException("File is not ready for download:" + file.getStatus());
+        }
         return new PreSignedUrlResponse(s3StorageService.generatePresignedGetUrl(file.getS3Key()));
     }
 
@@ -140,9 +163,16 @@ public class FileService {
         fileRepository.save(file);
 
         try{
-            s3StorageService.deleteObject(file.getS3Key());
-        }catch(Exception e){
+            if(file.getStatus() == UploadStatus.COMPLETED){
+                s3StorageService.deleteObject(file.getS3Key());
+            }else if(file.getStatus() == UploadStatus.UPLOADING &&
+                    file.getS3Key() != null && file.getS3MultipartUploadId() != null){
+                  s3StorageService.abortMultipartUpload(file.getS3Key(),file.getS3MultipartUploadId());
+            }
 
+        }catch(Exception e){
+            log.error("Failed to delete R2 object for file {} (key={}), object may be orphaned",
+                    fileId,file.getS3Key(),e);
         }
     }
 
@@ -151,6 +181,9 @@ public class FileService {
                 .orElseThrow(() -> new FileNotFoundException("File not Found : " + fileId));
 
         if(!file.getUserId().equals(userId)){
+            throw new FileNotFoundException("File not found: " + fileId);
+        }
+        if(file.getDeletedAt() != null){
             throw new FileNotFoundException("File not found: " + fileId);
         }
         return file;

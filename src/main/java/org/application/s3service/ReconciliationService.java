@@ -22,6 +22,7 @@ public class ReconciliationService {
     private static final Logger log = LoggerFactory.getLogger(ReconciliationService.class);
     private static final int STALE_HOURS = 24;
     private static final int BATCH_SIZE = 50;
+    private static final int RECLAIM_AFTER_MINUTES = 60;
 
     private final FileRepository fileRepository;
     private final S3StorageService s3StorageService;
@@ -39,7 +40,9 @@ public class ReconciliationService {
     @Transactional
     public void reconcileStaleUploads(){
         OffsetDateTime cutoff = OffsetDateTime.now().minusHours(STALE_HOURS);
-        List<UUID> claimedIds = fileRepository.claimStaleUploads(cutoff,BATCH_SIZE);
+        OffsetDateTime reclaimCutoff = OffsetDateTime.now().minusMinutes(RECLAIM_AFTER_MINUTES);
+        List<UUID> claimedIds = fileRepository.claimStaleUploads(cutoff,reclaimCutoff,BATCH_SIZE);
+
 
         if(claimedIds.isEmpty()){
             return;

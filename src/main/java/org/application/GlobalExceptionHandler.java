@@ -1,6 +1,7 @@
 package org.application;
 
 import org.application.dto.ErrorResponse;
+import org.application.exception.BadRequestException;
 import org.application.exception.FileNotFoundException;
 import org.application.exception.InvalidUploadStateException;
 import org.application.exception.RateLimitExceededException;
@@ -81,5 +82,13 @@ public class GlobalExceptionHandler {
         String requestId = MDC.get("requestId");
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(new ErrorResponse("RESOURCE_NOT_FOUND", "Not found", requestId));
+    }
+
+    @ExceptionHandler(BadRequestException.class)
+    public ResponseEntity<ErrorResponse>handleBadRequest(BadRequestException ex){
+        String requestId = MDC.get("requestId");
+        log.warn("[{}] BAD_REQUEST: {}",requestId,ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ErrorResponse("BAD_REQUEST",ex.getMessage(),requestId));
     }
 }
