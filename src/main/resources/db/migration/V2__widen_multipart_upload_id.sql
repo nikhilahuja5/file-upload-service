@@ -1,0 +1,1 @@
+ALTER TABLE files ALTER COLUMN s3_multipart_upload_id TYPE character varying(1024);

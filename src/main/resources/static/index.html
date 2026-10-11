@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 / Cloudflare R2 Multipart Upload</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+            background-color: #f9f9f9;
+            color: #333;
+        }
+        .card {
+            background: #ffffff;
+            border-radius: 8px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        .form-group {
+            margin-bottom: 16px;
+        }
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        input[type="text"], input[type="file"] {
+            width: 100%;
+            padding: 8px 12px;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        button {
+            background-color: #0066cc;
+            color: white;
+            border: none;
+            padding: 10px 18px;
+            font-size: 14px;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+        }
+        button:disabled {
+            background-color: #999;
+            cursor: not-allowed;
+        }
+        .progress-bar-container {
+            width: 100%;
+            background-color: #eee;
+            border-radius: 4px;
+            height: 12px;
+            margin-top: 16px;
+            overflow: hidden;
+            display: none;
+        }
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background-color: #0066cc;
+            transition: width 0.2s ease;
+        }
+        #statusLog {
+            margin-top: 16px;
+            font-size: 13px;
+            color: #555;
+            white-space: pre-wrap;
+            background: #f0f0f0;
+            padding: 10px;
+            border-radius: 4px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>Cloudflare R2 Multipart Upload</h2>
+
+    <div class="form-group">
+        <label for="userId">User ID</label>
+        <input type="text" id="userId" placeholder="demo-user-2" />
+    </div>
+
+    <div class="form-group">
+        <label for="fileInput">Select File</label>
+        <input type="file" id="fileInput" />
+    </div>
+
+    <button id="uploadBtn" onclick="handleUpload()">Upload File</button>
+
+    <div class="progress-bar-container" id="progressContainer">
+        <div class="progress-bar" id="progressBar"></div>
+    </div>
+
+    <div id="statusLog">Ready to upload.</div>
+
+    <button id="downloadBtn" onclick="handleDownload()" style="margin-top: 12px; display: none;">Download Last Uploaded File</button>
+</div>
+<script>
+    const CHUNK_SIZE = 5 * 1024 * 1024;
+    let lastUploadedFileId = null;
+
+    function log(message) {
+        const statusLog = document.getElementById('statusLog');
+        statusLog.textContent += '\n' + message;
+        statusLog.scrollTop = statusLog.scrollHeight;
+    }
+
+    function updateProgress(percentage) {
+        document.getElementById('progressContainer').style.display = 'block';
+        document.getElementById('progressBar').style.width = percentage + '%';
+    }
+
+    async function handleUpload() {
+        const userId = document.getElementById('userId').value.trim();
+        const fileInput = document.getElementById('fileInput');
+        const file = fileInput.files[0];
+
+        if (!userId) {
+            alert('Please enter a user ID.');
+            return;
+        }
+        if (!file) {
+            alert('Please select a file.');
+            return;
+        }
+
+        const uploadBtn = document.getElementById('uploadBtn');
+        uploadBtn.disabled = true;
+        document.getElementById('statusLog').textContent = "Starting upload sequence...";
+        updateProgress(0);
+
+        try {
+            log(`Initiating upload for: ${file.name}`);
+            const initResponse = await fetch('/api/files', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-User-Id': userId
+                },
+                body: JSON.stringify({
+                    fileName: file.name,
+                    mimeType: file.type || 'application/octet-stream',
+                    totalSizeBytes: file.size
+                })
+            });
+
+            if (!initResponse.ok) throw new Error(await initResponse.text());
+            const fileResponse = await initResponse.json();
+            const fileId = fileResponse.id;
+            log(`Upload initiated. File ID: ${fileId}`);
+
+            const totalParts = Math.ceil(file.size / CHUNK_SIZE);
+            const uploadedParts = [];
+
+            for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
+                const start = (partNumber - 1) * CHUNK_SIZE;
+                const end = Math.min(start + CHUNK_SIZE, file.size);
+                const chunk = file.slice(start, end);
+
+                log(`Requesting presigned URL for Part ${partNumber}/${totalParts}...`);
+
+                const presignResponse = await fetch(
+                    `/api/files/${fileId}/parts/${partNumber}/presign`,
+                    { headers: { 'X-User-Id': userId } }
+                );
+                if (!presignResponse.ok) throw new Error(await presignResponse.text());
+                const { url } = await presignResponse.json();
+
+                log(`Uploading Part ${partNumber}...`);
+                const uploadChunkResponse = await fetch(url, {
+                    method: 'PUT',
+                    body: chunk
+                });
+
+                if (!uploadChunkResponse.ok) {
+                    throw new Error(`Failed to upload part ${partNumber}`);
+                }
+
+                const eTag = uploadChunkResponse.headers.get('ETag');
+                log(`Part ${partNumber} uploaded. ETag: ${eTag}`);
+
+                uploadedParts.push({ partNumber: partNumber, eTag: eTag });
+
+                updateProgress(Math.round((partNumber / totalParts) * 100));
+            }
+
+            log("Completing multipart upload...");
+            const completeResponse = await fetch(`/api/files/${fileId}/complete`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-User-Id': userId
+                },
+                body: JSON.stringify({ parts: uploadedParts })
+            });
+
+            if (!completeResponse.ok) throw new Error(await completeResponse.text());
+            const completed = await completeResponse.json();
+
+            log(`Success! Status: ${completed.status}`);
+            alert("Upload completed successfully!");
+
+            lastUploadedFileId = fileId;
+            document.getElementById('downloadBtn').style.display = 'block';
+
+        } catch (error) {
+            log(`Error: ${error.message}`);
+            alert("Upload failed. See logs for details.");
+        } finally {
+            uploadBtn.disabled = false;
+        }
+    }
+
+    async function handleDownload() {
+        const userId = document.getElementById('userId').value.trim();
+        if (!lastUploadedFileId) return;
+
+        try {
+            const response = await fetch(`/api/files/${lastUploadedFileId}/download`, {
+                headers: { 'X-User-Id': userId }
+            });
+            if (!response.ok) throw new Error(await response.text());
+            const { url } = await response.json();
+            window.location.href = url;
+        } catch (error) {
+            log(`Download error: ${error.message}`);
+            alert("Download failed. See logs for details.");
+        }
+    }
+</script>
+
+
+</body>
+</html>
