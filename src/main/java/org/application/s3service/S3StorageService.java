@@ -151,7 +151,23 @@ public class S3StorageService {
                 .key(key)
                 .uploadId(uploadId)
                 .build();
-        s3Client.abortMultipartUpload(request);
+        try {
+            s3Client.abortMultipartUpload(request);
+        } catch(NoSuchUploadException e){
+
+        }
+    }
+
+    public boolean objectExists(String key){
+        try {
+            s3Client.headObject(HeadObjectRequest.builder()
+                    .bucket(r2Properties.bucketName())
+                    .key(key)
+                    .build());
+            return true;
+        } catch (NoSuchKeyException e) {
+            return false;
+        }
     }
 
 }

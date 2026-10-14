@@ -62,6 +62,12 @@ public class ReconciliationService {
         }
 
         try{
+            if(file.getS3Key() != null && s3StorageService.objectExists(file.getS3Key())){
+                file.setStatus(UploadStatus.COMPLETED);
+                fileRepository.save(file);
+                log.info("Reconciled upload {} -> COMPLETED (object found in R2)", id);
+                return;
+            }
             if(file.getS3Key() != null && file.getS3MultipartUploadId() != null){
                 s3StorageService.abortMultipartUpload(file.getS3Key(),file.getS3MultipartUploadId());
             }

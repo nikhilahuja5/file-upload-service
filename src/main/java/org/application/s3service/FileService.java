@@ -19,6 +19,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Timer;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -35,10 +36,12 @@ public class FileService {
     private final Counter uploadsCompletedCounter;
     private final Counter uploadsFailedCounter;
     private final Timer uploadCompletionTimer;
+    private final TransactionTemplate transactionTemplate;
     private static final Logger log = LoggerFactory.getLogger(FileService.class);
 
     public FileService(FileRepository fileRepository, FileChunkRepository fileChunkRepository,
-                       S3StorageService s3StorageService, MeterRegistry meterRegistry){
+                       S3StorageService s3StorageService, MeterRegistry meterRegistry,
+                       TransactionTemplate transactionTemplate){
         this.fileRepository = fileRepository;
         this.fileChunkRepository = fileChunkRepository;
         this.s3StorageService = s3StorageService;
@@ -46,6 +49,7 @@ public class FileService {
         this.uploadsCompletedCounter = meterRegistry.counter("uploads.completed");
         this.uploadsFailedCounter = meterRegistry.counter("uploads.failed");
         this.uploadCompletionTimer = meterRegistry.timer("uploads.completion.duration");
+        this.transactionTemplate = transactionTemplate;
     }
 
     public FileResponse initiateUpload(String userId,String idempotencyKey,InitiateUploadRequest request){
@@ -73,7 +77,15 @@ public class FileService {
         }
 
         String key = R2KeyGenerator.generatedKey(userId,file.getId(),request.fileName());
-        String uploadId = s3StorageService.startMultipartUpload(key);
+        String uploadId;
+        try{
+            uploadId = s3StorageService.startMultipartUpload(key);
+        }catch(RuntimeException e){
+            file.setStatus(UploadStatus.FAILED);
+            fileRepository.save(file);
+            uploadsFailedCounter.increment();
+            throw e;
+        }
 
         file.setS3Key(key);
         file.setS3MultipartUploadId(uploadId);
@@ -101,37 +113,44 @@ public class FileService {
         return s3StorageService.listParts(file.getS3Key(), file.getS3MultipartUploadId());
     }
 
-    @Transactional
+
     public FileResponse completeUpload(String userId, UUID fileId, CompleteUploadRequest request){
         return uploadCompletionTimer.record(()-> {
             Files file = getOwnedFileOrThrow(userId,fileId);
-            if(file.getStatus() != UploadStatus.UPLOADING){
+            int claimed = fileRepository.transitionStatus(fileId,UploadStatus.UPLOADING,UploadStatus.COMPLETING);
+            if(claimed == 0){
                 throw new InvalidUploadStateException("File " + fileId + " is not in UPLOADING state");
             }
-            List<PartSummary> authoritativeParts =
-                    s3StorageService.listParts(file.getS3Key(), file.getS3MultipartUploadId());
-            if (authoritativeParts.isEmpty()) {
-                throw new InvalidUploadStateException("No parts uploaded for file " + fileId);
+            List<PartSummary> authoritativeParts;
+            try {
+                authoritativeParts = s3StorageService.listParts(file.getS3Key(), file.getS3MultipartUploadId());
+                if (authoritativeParts.isEmpty()) {
+                    throw new InvalidUploadStateException("No parts uploaded for file " + fileId);
+                }
+                validateParts(authoritativeParts);
+                s3StorageService.completeMultipartUpload(
+                        file.getS3Key(), file.getS3MultipartUploadId(), authoritativeParts);
+            } catch (RuntimeException e) {
+                fileRepository.transitionStatus(fileId, UploadStatus.COMPLETING, UploadStatus.UPLOADING);
+                throw e;
             }
 
-            validateParts(authoritativeParts);
+            Files completed = transactionTemplate.execute(status -> {
+                for (PartSummary part : authoritativeParts) {
+                    FileChunk chunk = new FileChunk();
+                    chunk.setFile(file);
+                    chunk.setChunkNumber(part.partNumber());
+                    chunk.setEtag(part.eTag());
+                    chunk.setSizeBytes(part.sizeBytes());
+                    fileChunkRepository.save(chunk);
+                }
+                file.setStatus(UploadStatus.COMPLETED);
+                return fileRepository.save(file);
+            });
 
-            s3StorageService.completeMultipartUpload(
-                    file.getS3Key(), file.getS3MultipartUploadId(), authoritativeParts);
-
-            for (PartSummary part : authoritativeParts) {
-                FileChunk chunk = new FileChunk();
-                chunk.setFile(file);
-                chunk.setChunkNumber(part.partNumber());
-                chunk.setEtag(part.eTag());
-                chunk.setSizeBytes(part.sizeBytes());
-                fileChunkRepository.save(chunk);
-            }
-
-            file.setStatus(UploadStatus.COMPLETED);
-            file = fileRepository.save(file);
             uploadsCompletedCounter.increment();
-            return toResponse(file);
+            return toResponse(completed);
+
         });
     }
 
